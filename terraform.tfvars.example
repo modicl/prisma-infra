@@ -1,0 +1,31 @@
+# Copiar a terraform.tfvars (gitignoreado) y completar. NUNCA commitear el real.
+
+aws_region = "us-east-1"
+
+# null = Terraform elige las dos primeras subnets de la VPC por defecto.
+subnet_ids = null
+
+# Primera pasada: solo localhost. Segunda: agregar la URL de Amplify que sale en los outputs.
+front_urls = ["http://localhost:3002"]
+
+# Único a nivel global. Cambiarlo en cada cuenta nueva.
+cognito_domain_prefix = "prisma-login-XXXX"
+
+google_client_id     = "000000000000-xxxxxxxx.apps.googleusercontent.com"
+google_client_secret = "GOCSPX-..."
+
+entra_tenant_id     = "00000000-0000-0000-0000-000000000000"
+entra_client_id     = "00000000-0000-0000-0000-000000000000"
+entra_client_secret = "la columna VALUE, no el Secret ID"
+
+allowlist_activa  = false
+allowlist_correos = []
+
+db_password               = "cambiar"   # clave del usuario postgres de la instancia RDS
+supabase_url              = ""
+supabase_anon_key         = ""
+supabase_service_role_key = ""
+internal_token            = "generar uno largo y aleatorio"
+google_api_key            = "AIza..."
+
+desired_count = 1

@@ -1,0 +1,19 @@
+# Estado de Terraform: contiene los client secrets de Google/Entra en texto plano.
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+
+# Valores reales de las variables (secretos). Solo se versiona el .example.
+*.tfvars
+*.auto.tfvars
+
+# Salidas del inventario del lab actual (traen ARNs con el account id).
+inventario/
+crash.log
+
+# Zips de las Lambdas que arma archive_file.
+.build/
+
+# Planes de Terraform: pueden incluir valores de variables sensibles (secretos). Nunca se versionan.
+*.tfplan

@@ -1,0 +1,124 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# 09-red-privada.tf.pendiente — Subredes privadas + NAT Gateway para el workflow (y el monitor y Kafka).
+#
+# ESTADO: PROPUESTA, NO APLICADA. La extensión ".pendiente" hace que Terraform NO cargue este archivo.
+#
+# POR QUÉ
+#   Hoy la task de ECS vive en las subredes públicas por defecto con IP pública, porque sin NAT no podía bajar la imagen de ECR
+#   (ver el comentario de 03-ecs.tf). El objetivo del proyecto es que nada tenga IP pública. Con un NAT Gateway la task queda en
+#   subredes privadas y sale a Internet SIN IP propia: ECR, Gemini, Step Functions, Cognito (JWKS), etc. pasan por el NAT.
+#
+# QUÉ CREA
+#   * 2 subredes privadas (una por zona) dentro de la VPC por defecto del lab.
+#   * 1 NAT Gateway (con su IP elástica) en la primera subred pública. UNO solo: abarata, pero si esa zona cae se pierde la salida.
+#   * Una tabla de rutas privada: 0.0.0.0/0 -> NAT.
+#   * Endpoints de tipo Gateway para S3 y DynamoDB (gratis): ese tráfico no pasa por el NAT, que cobra por GB.
+#
+# COSTO (estimado, precios públicos de us-east-1; revisa el de tu cuenta): el NAT cuesta ~US$0,045 por hora (~US$33 al mes) más
+#   US$0,045 por GB procesado. Es lo más caro de todo el diseño. En el Learner Lab descuenta del presupuesto mientras exista.
+#
+# CÓMO ACTIVARLO
+#   1. Renombra este archivo a 09-red-privada.tf y corre `terraform plan`: debe mostrar SOLO recursos nuevos.
+#   2. `terraform apply`.
+#   3. En 03-ecs.tf, servicio `prisma-app`, cambia la red de la task (eso mueve la task a las subredes privadas):
+#        network_configuration {
+#          subnets          = local.private_subnet_ids
+#          security_groups  = [aws_security_group.ecs.id]
+#          assign_public_ip = false
+#        }
+#      y borra el comentario «Sin NAT Gateway en el lab». Lo mismo en 07-monitor.tf (servicio del monitor).
+#   4. `terraform apply` otra vez. ECS reemplaza la task: durante unos minutos el workflow no responde.
+#   El ALB y el VPC Link NO se mueven: ya son internos (sin IP pública) y siguen donde están.
+#
+# REVERSA: volver `subnets` a local.subnet_ids y `assign_public_ip = true`, aplicar y luego destruir este archivo.
+#
+# DEPENDE DEL LAB (no se pudo comprobar con el lab cerrado)
+#   * Que `ec2:CreateNatGateway` y `ec2:AllocateAddress` estén permitidos. Si no lo están, no hay alternativa privada que llegue
+#     a Gemini: habría que volver a IP pública o usar una instancia NAT propia (más frágil).
+#   * Que los rangos CIDR de abajo no choquen con subredes que ya existan en la VPC por defecto.
+# ──────────────────────────────────────────────────────────────────────────────
+
+variable "private_subnet_cidrs" {
+  description = "Un CIDR por subred privada. Deben caer dentro del rango de la VPC por defecto (172.31.0.0/16) y no chocar con subredes existentes."
+  type        = list(string)
+  default     = ["172.31.100.0/24", "172.31.101.0/24"]
+}
+
+data "aws_availability_zones" "disponibles" {
+  state = "available"
+}
+
+resource "aws_subnet" "privada" {
+  count = length(var.private_subnet_cidrs)
+
+  vpc_id                  = data.aws_vpc.default.id
+  cidr_block              = var.private_subnet_cidrs[count.index]
+  availability_zone       = data.aws_availability_zones.disponibles.names[count.index]
+  map_public_ip_on_launch = false
+
+  tags = {
+    Name = "${var.nombre}-privada-${count.index + 1}"
+  }
+}
+
+locals {
+  private_subnet_ids = aws_subnet.privada[*].id
+}
+
+resource "aws_eip" "nat" {
+  domain = "vpc"
+
+  tags = {
+    Name = "${var.nombre}-nat"
+  }
+}
+
+# El NAT va en una subred PÚBLICA (la primera de las por defecto): es la que tiene ruta al Internet Gateway.
+resource "aws_nat_gateway" "salida" {
+  allocation_id = aws_eip.nat.id
+  subnet_id     = local.subnet_ids[0]
+
+  tags = {
+    Name = "${var.nombre}-nat"
+  }
+}
+
+resource "aws_route_table" "privada" {
+  vpc_id = data.aws_vpc.default.id
+
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.salida.id
+  }
+
+  tags = {
+    Name = "${var.nombre}-privada"
+  }
+}
+
+resource "aws_route_table_association" "privada" {
+  count = length(aws_subnet.privada)
+
+  subnet_id      = aws_subnet.privada[count.index].id
+  route_table_id = aws_route_table.privada.id
+}
+
+# Gratis: S3 y DynamoDB se alcanzan por la red interna de AWS y no consumen NAT.
+resource "aws_vpc_endpoint" "s3" {
+  vpc_id            = data.aws_vpc.default.id
+  service_name      = "com.amazonaws.${local.region}.s3"
+  vpc_endpoint_type = "Gateway"
+  route_table_ids   = [aws_route_table.privada.id]
+}
+
+resource "aws_vpc_endpoint" "dynamodb" {
+  vpc_id            = data.aws_vpc.default.id
+  service_name      = "com.amazonaws.${local.region}.dynamodb"
+  vpc_endpoint_type = "Gateway"
+  route_table_ids   = [aws_route_table.privada.id]
+}
+
+output "private_subnet_ids" {
+  description = "Subredes privadas para las tasks de ECS (paso 3 del encabezado)."
+  value       = local.private_subnet_ids
+}

@@ -1,0 +1,138 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# 10-kafka.tf.pendiente — Kafka de un solo nodo en una instancia EC2 de la subred privada (para el monitor en vivo).
+#
+# ESTADO: PROPUESTA, NO APLICADA. La extensión ".pendiente" hace que Terraform NO cargue este archivo.
+# REQUIERE 09-red-privada.tf (subredes privadas + NAT) y 07-monitor.tf (define el grupo de seguridad `monitor`).
+#
+# POR QUÉ UN EC2
+#   El laboratorio no ofrece MSK. Una instancia con Docker corriendo `apache/kafka` (KRaft, sin ZooKeeper) es lo más simple que
+#   funciona. Es UN solo nodo, sin réplicas: sirve para el monitor (datos operativos sin PII), no para producción crítica.
+#
+# QUÉ CREA
+#   * Un grupo de seguridad que abre el 9092 SOLO al workflow (grupo `ecs`) y al monitor. Sin SSH y sin entrada desde Internet.
+#   * Una instancia t3.small en la primera subred privada, con IP privada FIJA (la dirección de Kafka no cambia si se reinicia).
+#   * Kafka en un contenedor con reinicio automático y los datos en un disco EBS cifrado de la propia instancia.
+#
+# CÓMO ACTIVARLO
+#   1. Aplica antes 09-red-privada y 07-monitor.
+#   2. Renombra este archivo a 10-kafka.tf, `terraform plan` y `terraform apply`.
+#   3. Pon la salida `kafka_bootstrap_servers` en terraform.tfvars (kafka_bootstrap_servers = "172.31.100.10:9092") y agrégala como
+#      KAFKA_BOOTSTRAP_SERVERS al contenedor `workflow` de la task (ver «WORKFLOW» en 07-monitor.tf.pendiente).
+#   El workflow no depende de Kafka: sin la variable, o con Kafka caído, descarta los eventos y sigue.
+#
+# LÍMITES CONOCIDOS
+#   * Sin TLS ni autenticación (PLAINTEXT), igual que en el compose local: el acceso se limita con el grupo de seguridad.
+#   * Si la instancia se destruye se pierde el historial del topic (el monitor lo reconstruye releyendo; el archivador ya lo copió a Postgres).
+#   * La instancia baja la imagen de Docker Hub por el NAT: si el lab limita las descargas anónimas, el primer arranque puede fallar.
+#
+# DEPENDE DEL LAB (no se pudo comprobar con el lab cerrado)
+#   * Que exista el perfil de instancia `LabInstanceProfile` (es el estándar del Learner Lab) y que se puedan lanzar instancias t3.small.
+# ──────────────────────────────────────────────────────────────────────────────
+
+variable "kafka_instance_type" {
+  description = "Tipo de instancia de Kafka."
+  type        = string
+  default     = "t3.small"
+}
+
+variable "kafka_instance_profile" {
+  description = "Perfil de instancia (el Learner Lab no permite crear roles)."
+  type        = string
+  default     = "LabInstanceProfile"
+}
+
+variable "kafka_image_tag" {
+  description = "Versión de apache/kafka (la misma que el compose local)."
+  type        = string
+  default     = "4.2.2"
+}
+
+data "aws_ami" "al2023" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["al2023-ami-2023*-kernel-*-x86_64"]
+  }
+}
+
+locals {
+  # IP fija dentro de la primera subred privada: la dirección de Kafka es estable aunque la instancia se reinicie.
+  kafka_ip = cidrhost(var.private_subnet_cidrs[0], 10)
+}
+
+resource "aws_security_group" "kafka" {
+  name        = "${var.nombre}-kafka"
+  description = "Kafka: entrada solo desde el workflow y el monitor"
+  vpc_id      = data.aws_vpc.default.id
+
+  ingress {
+    protocol        = "tcp"
+    from_port       = 9092
+    to_port         = 9092
+    security_groups = [aws_security_group.ecs.id, aws_security_group.monitor.id]
+  }
+
+  # Salida abierta: la instancia baja Docker y la imagen de Kafka por el NAT.
+  egress {
+    protocol    = "-1"
+    from_port   = 0
+    to_port     = 0
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_instance" "kafka" {
+  ami                    = data.aws_ami.al2023.id
+  instance_type          = var.kafka_instance_type
+  subnet_id              = local.private_subnet_ids[0]
+  private_ip             = local.kafka_ip
+  vpc_security_group_ids = [aws_security_group.kafka.id]
+  iam_instance_profile   = var.kafka_instance_profile
+
+  associate_public_ip_address = false
+
+  metadata_options {
+    http_tokens = "required" # IMDSv2
+  }
+
+  root_block_device {
+    volume_size = 20
+    volume_type = "gp3"
+    encrypted   = true
+  }
+
+  user_data_replace_on_change = true
+  user_data                   = <<-EOT
+    #!/bin/bash
+    set -euo pipefail
+    dnf install -y docker
+    systemctl enable --now docker
+    mkdir -p /data/kafka && chown 1000:1000 /data/kafka
+    docker run -d --name kafka --restart unless-stopped -p 9092:9092 -v /data/kafka:/var/lib/kafka/data \
+      -e KAFKA_NODE_ID=1 \
+      -e KAFKA_PROCESS_ROLES=broker,controller \
+      -e KAFKA_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093 \
+      -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://${local.kafka_ip}:9092 \
+      -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
+      -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093 \
+      -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
+      -e KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT \
+      -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
+      -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 \
+      -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 \
+      -e KAFKA_LOG_DIRS=/var/lib/kafka/data \
+      -e KAFKA_LOG_RETENTION_HOURS=168 \
+      apache/kafka:${var.kafka_image_tag}
+  EOT
+
+  tags = {
+    Name = "${var.nombre}-kafka"
+  }
+}
+
+output "kafka_bootstrap_servers" {
+  description = "Dirección de Kafka para el workflow y el monitor (paso 3 del encabezado)."
+  value       = "${local.kafka_ip}:9092"
+}

@@ -1,0 +1,336 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# 07-monitor.tf.pendiente — Monitor en vivo (prisma-monitor): API en ECS + front en Amplify.
+#
+# ESTADO: PROPUESTA, NO APLICADA. La extensión ".pendiente" hace que Terraform NO cargue este
+# archivo: un `terraform plan` o `apply` normal no lo toma. Se validó sintaxis y referencias con
+# `terraform validate` (sin tocar AWS), pero nunca se aplicó.
+#
+# QUÉ CREA
+#   ECS       servicio `prisma-monitor` (su propia task, NO dentro de `prisma-app`), Fargate 0.5 vCPU / 1 GB.
+#             Solo API (SERVE_FRONT=false): no publica HTML ni configuración sin autenticar.
+#   ALB       target group + regla de path `/api/monitor/*` (prioridad 5, antes que la de chat y que el default
+#             hacia el BFF; sin ella esa ruta iría al BFF y daría 404).
+#   Amplify   app aparte con el front estático. El build genera `config.json` con la URL del API Gateway.
+#   ECR       repositorio `prisma-monitor`.
+#
+# LO QUE NO TOCA (por diseño)
+#   * API Gateway: `ANY /api/{proxy+}` ya cubre `/api/monitor/metrics` y ya pasa por el authorizer de Cognito.
+#   * CORS: lo hace SOLO el API Gateway (`local.cors_origins`, sale de `front_urls`). El monitor no emite CORS;
+#     si lo hicieran los dos el navegador vería un Access-Control-Allow-Origin duplicado y rechazaría la respuesta.
+#   * Kafka: decidido el 2026-10-02: una instancia EC2 en la subred privada (ver 10-kafka.tf.pendiente). Ver "KAFKA" abajo.
+#
+# CÓMO ACTIVARLO (en este orden)
+#   1. Decide dónde corre Kafka y pon su dirección en terraform.tfvars:  kafka_bootstrap_servers = "host:9092"
+#   2. Sube `prisma-monitor` a GitHub (hoy es una carpeta sin git) y ajusta `github_repo_monitor` si hace falta.
+#      Amplify toma el código desde ahí, usando el mismo `github_token` del front.
+#   3. Renombra este archivo a 07-monitor.tf y corre `terraform plan`. Debe mostrar SOLO recursos nuevos
+#      (to add) y ninguno que cambie o se destruya. Si aparece otra cosa, no apliques.
+#   4. `terraform apply`. Esto crea el repositorio ECR vacío: el servicio de ECS queda sin tareas sanas hasta
+#      que exista la imagen (`prisma-monitor:latest`). Súbela con el pipeline del repo (push a main) o a mano.
+#   5. SEGUNDA PASADA: agrega la URL de Amplify del monitor (output `monitor_amplify_url`) a `front_urls`
+#      en terraform.tfvars y vuelve a aplicar. Eso registra el callback/logout en Cognito y el origen en el CORS
+#      del gateway (el mismo mecanismo que ya usas para el front principal).
+#   6. Agrega KAFKA_BOOTSTRAP_SERVERS al contenedor `workflow` (ver "WORKFLOW" abajo). Hasta entonces el
+#      workflow simplemente no publica: sin esa variable el publicador queda desactivado.
+#
+# MIENTRAS TANTO, EN LOCAL
+#   `docker compose up -d` (LOCAL.md) levanta todo, incluido este front servido por el propio monitor.
+# ──────────────────────────────────────────────────────────────────────────────
+
+variable "github_repo_monitor" {
+  description = "Repositorio de GitHub de prisma-monitor (Amplify publica su carpeta web/)."
+  type        = string
+  default     = "https://github.com/modicl/prisma-monitor"
+}
+
+variable "monitor_amplify_branch" {
+  description = "Rama de prisma-monitor que despliega Amplify."
+  type        = string
+  default     = "main"
+}
+
+variable "monitor_desired_count" {
+  description = "Tareas del monitor. Debe ser 1: cada instancia relee todo el topic y llevaría su propia copia del estado."
+  type        = number
+  default     = 1
+}
+
+variable "kafka_bootstrap_servers" {
+  description = "Dirección de Kafka (host:puerto). Vacío = el monitor arranca sin consumir. Ver la sección KAFKA."
+  type        = string
+  default     = ""
+}
+
+variable "kafka_topic" {
+  description = "Topic de eventos del workflow."
+  type        = string
+  default     = "prisma.agent-events"
+}
+
+variable "monitor_database_url" {
+  description = "Base de datos del respaldo (tabla log). Puede ser una base `prisma_monitor` en tu Postgres o BD_LOGS. Vacío = sin respaldo."
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "monitor_model_prices" {
+  description = "Tarifas por modelo en USD por millón de tokens, en JSON. Ej: {\"gemini-3.1-flash-lite\":{\"input\":X,\"cached_input\":Y,\"output\":Z}}. Vacío = costo 'sin tarifa'."
+  type        = string
+  default     = ""
+}
+
+locals {
+  monitor_dominio_cognito = "${aws_cognito_user_pool_domain.hosted.domain}.auth.${local.region}.amazoncognito.com"
+
+  # `local.cognito_env` viene de 03-ecs.tf (región, pool y client id).
+  monitor_env = merge(local.cognito_env, {
+    PORT                    = "3020"
+    SERVE_FRONT             = "false" # el front vive en Amplify
+    KAFKA_BOOTSTRAP_SERVERS = var.kafka_bootstrap_servers
+    KAFKA_TOPIC             = var.kafka_topic
+    MONITOR_DATABASE_URL    = var.monitor_database_url
+    MODEL_PRICES            = var.monitor_model_prices
+    STALL_MINUTES           = "30"
+    RETENTION_HOURS         = "168"
+  })
+}
+
+# ── ECR ───────────────────────────────────────────────────────────────────────
+resource "aws_ecr_repository" "monitor" {
+  name                 = "prisma-monitor"
+  image_tag_mutability = "MUTABLE"
+
+  image_scanning_configuration {
+    scan_on_push = false
+  }
+}
+
+# ── Red ───────────────────────────────────────────────────────────────────────
+resource "aws_security_group" "monitor" {
+  name        = "${var.nombre}-monitor"
+  description = "Monitor en vivo: entrada solo desde el ALB"
+  vpc_id      = data.aws_vpc.default.id
+
+  ingress {
+    description     = "API del monitor, solo desde el ALB interno"
+    protocol        = "tcp"
+    from_port       = 3020
+    to_port         = 3020
+    security_groups = [aws_security_group.alb.id]
+  }
+
+  egress {
+    protocol    = "-1"
+    from_port   = 0
+    to_port     = 0
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_lb_target_group" "monitor" {
+  name        = "tg-${var.nombre}-monitor"
+  vpc_id      = data.aws_vpc.default.id
+  target_type = "ip"
+  protocol    = "HTTP"
+  port        = 3020
+
+  health_check {
+    path                = "/health"
+    protocol            = "HTTP"
+    interval            = 30
+    timeout             = 5
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+    matcher             = "200"
+  }
+}
+
+# Prioridad 5: debe evaluarse ANTES que el default (BFF) para que /api/monitor/* no llegue al BFF.
+resource "aws_lb_listener_rule" "monitor" {
+  listener_arn = aws_lb_listener.http.arn
+  priority     = 5
+
+  condition {
+    path_pattern {
+      values = ["/api/monitor/*"]
+    }
+  }
+
+  action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.monitor.arn
+  }
+}
+
+# ── ECS: servicio propio ──────────────────────────────────────────────────────
+resource "aws_cloudwatch_log_group" "monitor" {
+  name = "/ecs/${var.nombre}-monitor"
+}
+
+resource "aws_ecs_task_definition" "monitor" {
+  family                   = "${var.nombre}-monitor"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = "512"
+  memory                   = "1024"
+  execution_role_arn       = data.aws_iam_role.lab.arn
+  task_role_arn            = data.aws_iam_role.lab.arn
+
+  runtime_platform {
+    cpu_architecture        = "X86_64"
+    operating_system_family = "LINUX"
+  }
+
+  # Tag :latest, no digest: con un digest fijo, un push nuevo a ECR no cambiaría nada (ver CLAUDE.md, «Trampa»).
+  # OJO: MONITOR_DATABASE_URL viaja como variable de entorno en texto plano, igual que en las otras tasks. Mejor
+  # Secrets Manager o SSM Parameter Store si el lab lo permite.
+  container_definitions = jsonencode([
+    {
+      name      = "monitor"
+      image     = "${local.ecr_base}/prisma-monitor:latest"
+      essential = true
+      portMappings = [{
+        containerPort = 3020
+        hostPort      = 3020
+        protocol      = "tcp"
+      }]
+      environment = [for k, v in local.monitor_env : { name = k, value = v }]
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          awslogs-group         = aws_cloudwatch_log_group.monitor.name
+          awslogs-region        = local.region
+          awslogs-stream-prefix = "ecs"
+        }
+      }
+    }
+  ])
+}
+
+resource "aws_ecs_service" "monitor" {
+  name            = "${var.nombre}-monitor"
+  cluster         = aws_ecs_cluster.cluster.id
+  task_definition = aws_ecs_task_definition.monitor.arn
+  desired_count   = var.monitor_desired_count
+  launch_type     = "FARGATE"
+
+  health_check_grace_period_seconds = 60
+
+  network_configuration {
+    subnets          = local.subnet_ids
+    security_groups  = [aws_security_group.monitor.id]
+    assign_public_ip = true # subredes públicas por defecto: necesita IP pública para bajar la imagen de ECR
+  }
+
+  load_balancer {
+    target_group_arn = aws_lb_target_group.monitor.arn
+    container_name   = "monitor"
+    container_port   = 3020
+  }
+
+  lifecycle {
+    ignore_changes = [desired_count]
+  }
+
+  depends_on = [aws_lb_listener_rule.monitor]
+}
+
+# ── Amplify: front estático ───────────────────────────────────────────────────
+# El repo tiene web/{index.html,app.js,style.css}. index.html referencia /static/app.js y /static/style.css
+# (así lo sirve también el monitor en local), por eso el build copia los assets a dist/static/.
+resource "aws_amplify_app" "monitor" {
+  name         = "${var.nombre}-monitor"
+  platform     = "WEB"
+  repository   = var.github_repo_monitor
+  access_token = var.github_token
+
+  enable_branch_auto_build = false
+
+  build_spec = <<-EOT
+    version: 1
+    frontend:
+      phases:
+        build:
+          commands:
+            - mkdir -p dist/static
+            - cp web/index.html dist/index.html
+            - cp web/app.js web/style.css dist/static/
+            - printf '{"apiBase":"%s","cognitoDomain":"%s","clientId":"%s","region":"%s"}\n' "$MONITOR_API_BASE" "$MONITOR_COGNITO_DOMAIN" "$MONITOR_COGNITO_CLIENT_ID" "$MONITOR_COGNITO_REGION" > dist/config.json
+      artifacts:
+        baseDirectory: dist
+        files:
+          - "**/*"
+  EOT
+
+  # Fallback de SPA (/login, /auth/callback -> index.html). DEBE ser 200 (rewrite), nunca 301/302: un redirect
+  # cambiaría la URL y destruiría el ?code= del login. La regex deja pasar los archivos con extensión conocida.
+  custom_rule {
+    source = "</^[^.]+$|\\.(?!(css|gif|ico|jpg|js|png|txt|svg|woff|woff2|ttf|map|json)$)([^.]+$)/>"
+    target = "/index.html"
+    status = "200"
+  }
+
+  # En Amplify la CSP la pone el hosting (en local la pone el propio monitor). connect-src incluye la API y Cognito.
+  custom_headers = <<-EOT
+    customHeaders:
+      - pattern: '**'
+        headers:
+          - key: Content-Security-Policy
+            value: "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' ${aws_apigatewayv2_api.api.api_endpoint} https://${local.monitor_dominio_cognito}; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+          - key: X-Content-Type-Options
+            value: nosniff
+          - key: Referrer-Policy
+            value: no-referrer
+          - key: X-Frame-Options
+            value: DENY
+          - key: Strict-Transport-Security
+            value: max-age=31536000; includeSubDomains
+  EOT
+
+  environment_variables = {
+    MONITOR_API_BASE          = aws_apigatewayv2_api.api.api_endpoint
+    MONITOR_COGNITO_DOMAIN    = local.monitor_dominio_cognito
+    MONITOR_COGNITO_CLIENT_ID = aws_cognito_user_pool_client.front.id
+    MONITOR_COGNITO_REGION    = local.region
+  }
+}
+
+resource "aws_amplify_branch" "monitor" {
+  app_id      = aws_amplify_app.monitor.id
+  branch_name = var.monitor_amplify_branch
+  stage       = "PRODUCTION"
+  framework   = "Web"
+
+  enable_auto_build = true
+  ttl               = "5"
+}
+
+output "monitor_amplify_url" {
+  description = "Agregar a front_urls y volver a aplicar (segunda pasada): registra el callback en Cognito y el origen en el CORS del gateway."
+  value       = "https://${aws_amplify_branch.monitor.branch_name}.${aws_amplify_app.monitor.default_domain}"
+}
+
+output "monitor_ecr_repo" {
+  value = aws_ecr_repository.monitor.repository_url
+}
+
+# ── WORKFLOW (cambio en 03-ecs.tf, NO incluido aquí para no tocar el archivo existente) ──────────────────────
+# En `local.env`, dentro de `workflow = merge(local.cognito_env, { ... })`, agregar:
+#
+#     KAFKA_BOOTSTRAP_SERVERS = var.kafka_bootstrap_servers
+#     KAFKA_TOPIC             = var.kafka_topic
+#
+# Sin KAFKA_BOOTSTRAP_SERVERS el publicador del workflow queda desactivado (no intenta conectarse a nada).
+# Es seguro desplegar la imagen nueva del workflow antes de activar esto.
+
+# ── KAFKA (decidido: EC2 en subred privada, ver 10-kafka.tf.pendiente) ─────────────────────────────────────────────────────────────────────────────
+# Opciones (ver la conversación de diseño): MSK, o un servicio ECS propio de un solo nodo con volumen EFS.
+# Sea cual sea, hay que:
+#   * dejarlo en subredes privadas, sin IP pública;
+#   * abrir el puerto 9092 SOLO a las tasks que lo usan:
+#       aws_security_group.ecs      (el workflow, en la task `prisma-app`)
+#       aws_security_group.monitor  (el monitor)
+#   * darle un nombre DNS estable (Service Connect o Cloud Map) y poner ese nombre en `kafka_bootstrap_servers`;
+#   * en MSK, activar TLS y autenticación (en el compose local va en PLAINTEXT).
+# Los eventos no llevan PII, pero siguen siendo datos operativos.
