@@ -13,7 +13,12 @@
 #     (la VPC por defecto solo tiene subredes públicas): "privada" significa sin IP pública y sin regla de entrada.
 #
 # LO QUE TERRAFORM NO HACE (manual en una cuenta nueva, después del apply)
-#   1. Crear las 4 bases:  CREATE DATABASE prisma_users; ... prisma_docs; prisma_perfil; prisma_adminpanel;
+#   1. Crear las bases:  CREATE DATABASE prisma_users; ... prisma_docs; prisma_perfil; prisma_adminpanel; prisma_rag;
+#      y en prisma_rag:  CREATE EXTENSION vector;  (RAG normativo; pgvector 0.8.x viene con RDS PostgreSQL 18).
+#      Hay un script que abre el RDS solo para tu IP y ejecuta el SQL: scripts/rds_acceso.py (abrir | sql | cerrar).
+#   1b. Rol de solo lectura del RAG (el workflow NO usa la clave maestra), con la clave de rag_lector_password:
+#      CREATE ROLE rag_lector LOGIN PASSWORD '...';  GRANT CONNECT ON DATABASE prisma_rag TO rag_lector;
+#      y en prisma_rag:  GRANT USAGE ON SCHEMA public TO rag_lector;  GRANT SELECT ON documentos, fragmentos TO rag_lector;
 #   2. Correr las migraciones: `prisma migrate deploy` en users, docs y perfil, y `prisma db push` en adminpanel.
 #   Para ambas hay que abrir la base un momento: publicly_accessible = true y una regla del 5432 desde tu IP /32.
 #   Ciérrala al terminar.
@@ -26,6 +31,12 @@ variable "db_username" {
   description = "Usuario administrador de la instancia."
   type        = string
   default     = "postgres"
+}
+
+variable "rag_lector_password" {
+  description = "Clave del rol de solo lectura `rag_lector` (RAG normativo). El workflow usa este rol, no el maestro."
+  type        = string
+  sensitive   = true
 }
 
 variable "db_password" {

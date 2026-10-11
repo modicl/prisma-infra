@@ -51,6 +51,11 @@ locals {
     } : servicio => "postgresql://${var.db_username}:${urlencode(var.db_password)}@${aws_db_instance.postgres.address}:5432/${base}?sslmode=require&sslaccept=accept_invalid_certs"
   }
 
+  # RAG normativo. El workflow procesa documentos no confiables con un LLM, así que NO recibe la clave maestra: usa el rol
+  # `rag_lector` (solo SELECT sobre prisma_rag; ver 11-postgres.tf). asyncpg no entiende los parámetros propios de Prisma
+  # (sslaccept), así que la URL lleva solo sslmode.
+  rag_database_url = "postgresql://rag_lector:${urlencode(var.rag_lector_password)}@${aws_db_instance.postgres.address}:5432/prisma_rag?sslmode=require"
+
   cognito_env = {
     COGNITO_REGION       = local.region
     COGNITO_USER_POOL_ID = aws_cognito_user_pool.pool.id
@@ -120,6 +125,9 @@ locals {
       GOOGLE_API_KEY = var.google_api_key
       # Orquestación por Step Functions: SendTask*, heartbeat y cancelación. Ver 08-flujo-sfn.tf.
       SFN_STATE_MACHINE_ARN = aws_sfn_state_machine.flujo.arn
+      # RAG normativo (pgvector). Si falla la conexión, cada fase lo registra y sigue sin fragmentos. Para apagarlo en AWS,
+      # quita esta línea (con la variable vacía el código lo trata como apagado).
+      RAG_DATABASE_URL = local.rag_database_url
     })
     } : c => [for k, v in vars : { name = k, value = v }]
   }
